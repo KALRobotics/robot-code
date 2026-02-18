@@ -68,6 +68,9 @@ public class Robot extends TimedRobot {
   // Limit PID output when holding against external force - prevents motor stall/burn
   private static final double MAX_HOLD_OUTPUT = 0.5;
 
+  // Teleop: limit max output to reduce current draw and prevent brownouts
+  private static final double TELEOP_MAX_OUTPUT = 0.85;
+
   public Robot() {
     m_rightGroup.setInverted(true);
 
@@ -77,11 +80,13 @@ public class Robot extends TimedRobot {
 
   @Override
   public void robotInit() {
-    // Current limit protects motors when fighting external force (Test mode hold)
+    // Brownout prevention: lower current limits, ramp rate, voltage compensation
     var motorConfig =
         new SparkMaxConfig()
-            .smartCurrentLimit(40, 60) // 40A stall, 60A free - NEO safe limits
-            .idleMode(SparkBaseConfig.IdleMode.kBrake);
+            .smartCurrentLimit(30, 45) // Lower than NEO max - reduces brownout risk
+            .idleMode(SparkBaseConfig.IdleMode.kBrake)
+            .openLoopRampRate(0.25) // 0.25s to reach target - smooths current spikes
+            .voltageCompensation(12.0); // Compensates as battery voltage drops (12V nominal)
     for (var motor : new SparkMax[] {m_leftLeader, m_leftFollower, m_rightLeader, m_rightFollower}) {
       motor.configure(motorConfig, ResetMode.kNoResetSafeParameters, PersistMode.kPersistParameters);
     }
@@ -90,8 +95,8 @@ public class Robot extends TimedRobot {
 
   @Override
   public void teleopPeriodic() {
-    double leftY = -m_driverController.getRawAxis(1);
-    double rightY = -m_driverController.getRawAxis(5);
+    double leftY = MathUtil.clamp(-m_driverController.getRawAxis(1), -TELEOP_MAX_OUTPUT, TELEOP_MAX_OUTPUT);
+    double rightY = MathUtil.clamp(-m_driverController.getRawAxis(5), -TELEOP_MAX_OUTPUT, TELEOP_MAX_OUTPUT);
 
     m_drive.tankDrive(leftY, rightY);
   }
