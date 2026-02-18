@@ -4,94 +4,139 @@
 
 package frc.robot;
 
+import com.revrobotics.PersistMode;
+import com.revrobotics.ResetMode;
+import com.revrobotics.RelativeEncoder;
+import com.revrobotics.spark.SparkLowLevel.MotorType;
+import com.revrobotics.spark.SparkMax;
+import com.revrobotics.spark.config.SparkBaseConfig;
+import com.revrobotics.spark.config.SparkMaxConfig;
 import com.studica.frc.AHRS;
-import edu.wpi.first.wpilibj.SPI;
+import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.controller.PIDController;
-import com.ctre.phoenix.motorcontrol.can.WPI_VictorSPX;
-import edu.wpi.first.util.sendable.SendableRegistry;
 import edu.wpi.first.wpilibj.Joystick;
 import edu.wpi.first.wpilibj.TimedRobot;
 import edu.wpi.first.wpilibj.drive.DifferentialDrive;
-import edu.wpi.first.units.*;
+import edu.wpi.first.wpilibj.motorcontrol.MotorControllerGroup;
 
 /**
- * This is a demo program showing the use of the DifferentialDrive class,
- * specifically it contains
- * the code necessary to operate a robot with tank drive.
+ * Basic robot with Spark MAX + NEO motors, tank drive, NavX2, and Logitech F310.
+ * - Teleop: Manual tank drive (no gyro/encoders)
+ * - Test: Button A = hold rotation with PID + gyro; Button B = hold position 0.5m ahead with PID + encoders
  */
 public class Robot extends TimedRobot {
 
-  private float targetAngle;
-  private AHRS navx;
-  private final DifferentialDrive m_robotDrive;
+  // Controller - Logitech F310 (A=1, B=2, Left stick Y=axis 1, Right stick Y=axis 5)
+  private final Joystick m_driverController = new Joystick(0);
 
-  private final Joystick m_driverController;
+  // Spark MAX + NEO motors - tank drive (2 per side)
+  // CAN IDs: adjust for your robot
+  private final SparkMax m_leftLeader = new SparkMax(1, MotorType.kBrushless);
+  private final SparkMax m_leftFollower = new SparkMax(2, MotorType.kBrushless);
+  private final SparkMax m_rightLeader = new SparkMax(3, MotorType.kBrushless);
+  private final SparkMax m_rightFollower = new SparkMax(4, MotorType.kBrushless);
 
-  private final PIDController m_pid = new PIDController(0.02, 0, 0.002);
-  // Left side motor controllers (CAN IDs)
-  private final WPI_VictorSPX m_leftBackMotor = new WPI_VictorSPX(0);
-  private final WPI_VictorSPX m_rightBackMotor = new WPI_VictorSPX(1);
+  private final MotorControllerGroup m_leftGroup =
+      new MotorControllerGroup(m_leftLeader, m_leftFollower);
+  private final MotorControllerGroup m_rightGroup =
+      new MotorControllerGroup(m_rightLeader, m_rightFollower);
 
-  private final WPI_VictorSPX m_leftFrontMotor = new WPI_VictorSPX(2);
-  private final WPI_VictorSPX m_rightFrontMotor = new WPI_VictorSPX(3);
+  private final DifferentialDrive m_drive = new DifferentialDrive(m_leftGroup, m_rightGroup);
 
-  // Right side motor controllers (CAN IDs)
+  // NavX2 via SPI (RoboRIO 2.0 MXP port)
+  private final AHRS m_gyro = new AHRS(AHRS.NavXComType.kMXP_SPI);
 
-  /** Called once at the beginning of the robot program. */
+  // Encoders from NEO built-in
+  private final RelativeEncoder m_leftEncoder = m_leftLeader.getEncoder();
+  private final RelativeEncoder m_rightEncoder = m_rightLeader.getEncoder();
+
+  // Tune these for your drivetrain (wheel diameter, gear ratio)
+  private static final double ENCODER_REVS_PER_METER = 20.0;
+
+  // Test mode: rotation hold (Button A)
+  private double m_targetRotationDeg = 0;
+  private boolean m_rotationHoldActive = false;
+  private final PIDController m_rotationPid =
+      new PIDController(0.02, 0.0, 0.001); // Tune later
+
+  // Test mode: position hold (Button B) - 0.5m ahead
+  private double m_targetPositionMeters = 0;
+  private boolean m_positionHoldActive = false;
+  private final PIDController m_positionPid =
+      new PIDController(0.5, 0.0, 0.0); // Tune later
+
+  // Limit PID output when holding against external force - prevents motor stall/burn
+  private static final double MAX_HOLD_OUTPUT = 0.5;
+
   public Robot() {
+    m_rightGroup.setInverted(true);
 
-    try {
-      // Use SPI.Port.kMXP for a navX2-MXP plugged into the center port
-      navx = new AHRS(AHRS.NavXComType.kMXP_SPI);
-    } catch (RuntimeException ex) {
-      System.out.println("Error instantiating navX: " + ex.getMessage());
-    }
-
-    // Set up follower motors - motor 2 on each side follows motor 1
-    m_leftBackMotor.follow(m_leftFrontMotor);
-    m_rightBackMotor.follow(m_rightFrontMotor);
-
-    // We need to invert one side of the drivetrain so that positive voltages
-    // result in both sides moving forward. Depending on how your robot's
-    // gearbox is constructed, you might have to invert the left side instead.
-    m_rightFrontMotor.setInverted(true);
-    m_rightBackMotor.setInverted(true);
-
-    m_robotDrive = new DifferentialDrive(m_leftFrontMotor, m_rightFrontMotor);
-    m_driverController = new Joystick(0);
-
-    SendableRegistry.addChild(m_robotDrive, m_leftFrontMotor);
-    SendableRegistry.addChild(m_robotDrive, m_rightFrontMotor);
+    m_rotationPid.setTolerance(2.0);
+    m_positionPid.setTolerance(0.02);
   }
 
+  @Override
+  public void robotInit() {
+    // Current limit protects motors when fighting external force (Test mode hold)
+    var motorConfig =
+        new SparkMaxConfig()
+            .smartCurrentLimit(40, 60) // 40A stall, 60A free - NEO safe limits
+            .idleMode(SparkBaseConfig.IdleMode.kBrake);
+    for (var motor : new SparkMax[] {m_leftLeader, m_leftFollower, m_rightLeader, m_rightFollower}) {
+      motor.configure(motorConfig, ResetMode.kNoResetSafeParameters, PersistMode.kPersistParameters);
+    }
+    // NavX2 auto-calibrates on power-up; hold robot still during init
+  }
 
   @Override
   public void teleopPeriodic() {
-    m_robotDrive.tankDrive(
-        -m_driverController.getRawAxis(1),
-        -m_driverController.getRawAxis(5));
+    double leftY = -m_driverController.getRawAxis(1);
+    double rightY = -m_driverController.getRawAxis(5);
+
+    m_drive.tankDrive(leftY, rightY);
   }
 
   @Override
   public void testInit() {
-    // Test modu ilk başladığında yapılacaklar (isteğe bağlı)
+    m_rotationHoldActive = false;
+    m_positionHoldActive = false;
   }
 
   @Override
   public void testPeriodic() {
-    // A,B,X,Y
-    if (m_driverController.getRawButtonPressed(1)) 
-    {
-      targetAngle = navx.getYaw() + 10f;
-    }
-    if (m_driverController.getRawButtonPressed(2)) 
-    {
-      targetAngle = navx.getYaw();
+    // Button A: set target rotation to current, hold with PID + gyro
+    if (m_driverController.getRawButtonPressed(1)) {
+      m_targetRotationDeg = m_gyro.getAngle();
+      m_rotationHoldActive = true;
+      m_positionHoldActive = false;
     }
 
-      m_pid.enableContinuousInput(-180, 180);
+    // Button B: set target position 0.5m ahead, hold with PID + encoders
+    if (m_driverController.getRawButtonPressed(2)) {
+      double avgRevs = (m_leftEncoder.getPosition() + m_rightEncoder.getPosition()) / 2.0;
+      m_targetPositionMeters = (avgRevs / ENCODER_REVS_PER_METER) + 0.5;
+      m_positionHoldActive = true;
+      m_rotationHoldActive = false;
+    }
 
-      double output = m_pid.calculate(navx.getYaw(), targetAngle);
-      m_robotDrive.arcadeDrive(0, output);
+    if (m_rotationHoldActive) {
+      double output =
+          MathUtil.clamp(
+              m_rotationPid.calculate(m_gyro.getAngle(), m_targetRotationDeg),
+              -MAX_HOLD_OUTPUT,
+              MAX_HOLD_OUTPUT);
+      m_drive.arcadeDrive(0, output);
+    } else if (m_positionHoldActive) {
+      double avgRevs = (m_leftEncoder.getPosition() + m_rightEncoder.getPosition()) / 2.0;
+      double currentMeters = avgRevs / ENCODER_REVS_PER_METER;
+      double output =
+          MathUtil.clamp(
+              m_positionPid.calculate(currentMeters, m_targetPositionMeters),
+              -MAX_HOLD_OUTPUT,
+              MAX_HOLD_OUTPUT);
+      m_drive.arcadeDrive(output, 0);
+    } else {
+      m_drive.stopMotor();
+    }
   }
 }
